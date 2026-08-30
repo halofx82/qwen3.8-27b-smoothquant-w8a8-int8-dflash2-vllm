@@ -14,9 +14,11 @@ services:
       - ./.cache/vllm:/root/.cache/vllm
     environment:
       CUDA_VISIBLE_DEVICES: ${CUDA_VISIBLE_DEVICES:-0,1,2,3}
+      CUDA_DEVICE_ORDER: PCI_BUS_ID
       TENSOR_PARALLEL_SIZE: ${TENSOR_PARALLEL_SIZE:-4}
       MAX_MODEL_LEN: ${MAX_MODEL_LEN:-131072}
       PYTORCH_ALLOC_CONF: expandable_segments:False
+      VLLM_MARLIN_USE_ATOMIC_ADD: "1"
     deploy:
       resources:
         reservations:
@@ -28,7 +30,7 @@ services:
       - serve
       - Freaksterz/Qwen3.8-27B-SmoothQuant-W8A8-INT8
       - --served-model-name
-      - freaksterz-qwen38-27b
+      - qwen3.8-27b
       - --host
       - 0.0.0.0
       - --port
@@ -49,11 +51,12 @@ services:
       - "4096"
       - --kv-cache-dtype
       - fp8_e4m3
-      - --disable-custom-all-reduce
-      - --no-enable-prefix-caching
+      - --enable-prefix-caching
       - --enable-chunked-prefill
-      - --language-model-only
       - --reasoning-parser
       - qwen3
+      - --tool-call-parser
+      - qwen3_coder
+      - --enable-auto-tool-choice
       - --speculative-config
       - '{"method":"dflash","model":"${DRAFT_MODEL:-z-lab/Qwen3.8-27B-DFlash2}","num_speculative_tokens":7}'
