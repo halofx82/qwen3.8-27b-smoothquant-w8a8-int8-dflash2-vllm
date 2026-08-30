@@ -1,3 +1,4 @@
 torch
 safetensors
 huggingface_hub
+numpy
