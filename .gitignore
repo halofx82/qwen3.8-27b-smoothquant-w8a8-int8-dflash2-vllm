@@ -1,2 +1,5 @@
 .cache/
 .env
+__pycache__/
+rotation-R.pt
+freaksterz-dflash-adapter.safetensors
