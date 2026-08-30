@@ -1,0 +1,8 @@
+.git
+.cache
+.env
+README.md
+LICENSE
+.env.example
+docker-compose.yaml
+hf

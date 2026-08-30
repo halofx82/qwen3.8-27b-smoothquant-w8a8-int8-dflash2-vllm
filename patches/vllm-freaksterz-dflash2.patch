@@ -1,0 +1,226 @@
+--- vllm/model_executor/models/qwen3_dflash.py
++++ vllm/model_executor/models/qwen3_dflash.py
+@@ -484,8 +484,22 @@
+         layers_attn: list[nn.Module],
+         has_bias: bool,
+     ) -> None:
++        # The dense draft can fuse the five K/V projections into one GEMM.
++        # Compressed-tensors QKVParallelLinear intentionally has no .weight;
++        # retain the quantized projections and run them individually instead.
++        self._context_qkv_projs = [a.qkv_proj for a in layers_attn]
++        self._use_fused_context_kv = all(
++            getattr(qkv_proj, "weight", None) is not None
++            for qkv_proj in self._context_qkv_projs
++        )
+         self._hidden_norm_weight = self.hidden_norm.weight.data
+ 
++        if not self._use_fused_context_kv:
++            logger.info(
++                "DFlash context-KV uses quantized per-layer QKV projections"
++            )
++            return
++
+         # KV projection weights: [num_layers * 2 * kv_size, hidden_size]
+         kv_weights = [a.qkv_proj.weight[a.q_size :] for a in layers_attn]
+         self._fused_kv_weight = torch.cat(kv_weights, dim=0)
+@@ -560,6 +574,23 @@
+             self._hidden_norm_weight,
+             self._rms_norm_eps,
+         )
++        if not self._use_fused_context_kv:
++            all_k: list[torch.Tensor] = []
++            all_v: list[torch.Tensor] = []
++            for qkv_proj in self._context_qkv_projs:
++                qkv, _ = qkv_proj(normed_context_states)
++                q_size = qkv.shape[-1] - 2 * num_kv_heads * head_dim
++                _, k, v = qkv.split(
++                    [q_size, num_kv_heads * head_dim, num_kv_heads * head_dim],
++                    dim=-1,
++                )
++                all_k.append(k.view(num_ctx, num_kv_heads, head_dim))
++                all_v.append(v.view(num_ctx, num_kv_heads, head_dim))
++            return (
++                torch.stack(all_k, dim=0).contiguous(),
++                torch.stack(all_v, dim=0).contiguous(),
++            )
++
+         all_kv_flat = F.linear(
+             normed_context_states, self._fused_kv_weight, self._fused_kv_bias
+         )
+--- vllm/model_executor/models/qwen3_dflash2.py
++++ vllm/model_executor/models/qwen3_dflash2.py
+@@ -1,8 +1,11 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ 
++import os
++
+ import torch
+ import torch.nn.functional as F
++from safetensors import safe_open
+ from torch import nn
+ 
+ from vllm.compilation.backends import set_model_tag
+@@ -11,6 +14,7 @@
+ from vllm.model_executor.layers.linear import ReplicatedLinear
+ from vllm.model_executor.layers.logits_processor import LogitsProcessor
+ from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
++from vllm.logger import init_logger
+ 
+ from .qwen3_dflash import (
+     DFlashQwen3DecoderLayer,
+@@ -20,6 +24,10 @@
+ from .utils import maybe_prefix
+ 
+ 
++logger = init_logger(__name__)
++_FREAKSTERZ_ADAPTER_ENV = "FREAKSTERZ_DFLASH_ADAPTER"
++
++
+ def _grouped_conv(
+     hidden_states: torch.Tensor,
+     delta: torch.Tensor,
+@@ -251,6 +259,53 @@
+         self.input_embedding_scale = float(
+             draft_config.get("input_embedding_scale", 1.0)
+         )
++        self._freaksterz_adapter_enabled = False
++        self._freaksterz_trace_dir = os.environ.get("FREAKSTERZ_DFLASH_TRACE_DIR")
++        self._freaksterz_trace_written: set[str] = set()
++        adapter_path = os.environ.get(_FREAKSTERZ_ADAPTER_ENV)
++        if adapter_path:
++            if not os.path.isfile(adapter_path):
++                raise RuntimeError(f"Freaksterz adapter not found: {adapter_path}")
++            with safe_open(adapter_path, framework="pt", device="cpu") as adapter:
++                metadata = adapter.metadata() or {}
++                if metadata.get("format_version") != "1":
++                    raise RuntimeError(
++                        "unsupported Freaksterz adapter format_version: "
++                        f"{metadata.get('format_version')!r}"
++                    )
++                rotation = adapter.get_tensor("rotation")
++                gain_inv = adapter.get_tensor("gain_inv")
++            hidden_size = int(self.config.hidden_size)
++            if tuple(rotation.shape) != (hidden_size, hidden_size):
++                raise RuntimeError(
++                    f"Freaksterz rotation shape {tuple(rotation.shape)} != "
++                    f"({hidden_size}, {hidden_size})"
++                )
++            if tuple(gain_inv.shape) != (hidden_size,):
++                raise RuntimeError(
++                    f"Freaksterz gain_inv shape {tuple(gain_inv.shape)} != "
++                    f"({hidden_size},)"
++                )
++            if not torch.isfinite(rotation).all() or not torch.isfinite(gain_inv).all():
++                raise RuntimeError("Freaksterz adapter contains non-finite values")
++            device = (
++                torch.device("cuda", torch.cuda.current_device())
++                if torch.cuda.is_available()
++                else torch.device("cpu")
++            )
++            params_dtype = vllm_config.model_config.dtype
++            self.register_buffer(
++                "_freaksterz_rotation",
++                rotation.to(device=device, dtype=params_dtype).contiguous(),
++                persistent=False,
++            )
++            self.register_buffer(
++                "_freaksterz_gain_inv",
++                gain_inv.to(device=device, dtype=params_dtype).contiguous(),
++                persistent=False,
++            )
++            self._freaksterz_adapter_enabled = True
++            logger.info("Enabled Freaksterz DFlash2 basis adapter from %s", adapter_path)
+         # Without its own tag the selector shares the draft head's compile cache.
+         with set_model_tag("dflash2_candidate_selector"):
+             self.candidate_selector = CandidateSelector(
+@@ -263,7 +316,46 @@
+             )
+ 
+     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
+-        return super().embed_input_ids(input_ids) * self.input_embedding_scale
++        embeds = self.embed_tokens(input_ids)
++        if self._freaksterz_adapter_enabled:
++            # Freaksterz row convention: h_rot = h_native @ R.T.
++            # Its shared embedding is rotated, so return h_native = h_rot @ R.
++            embeds = torch.matmul(embeds, self._freaksterz_rotation)
++        # A separately shipped DFlash mask embedding is already in DFlash's
++        # native basis, so substitute it after converting the shared embedding.
++        if self.has_separate_mask_embedding and self.mask_token_id is not None:
++            is_mask = (input_ids == self.mask_token_id).unsqueeze(-1)
++            embeds = torch.where(
++                is_mask,
++                self.mask_embedding.to(embeds.dtype),
++                embeds,
++            )
++        return embeds * self.input_embedding_scale
++
++    def trace_boundary(self, name: str, value: torch.Tensor) -> None:
++        """Write one eager diagnostic sample per worker when requested."""
++        if not self._freaksterz_trace_dir or name in self._freaksterz_trace_written:
++            return
++        os.makedirs(self._freaksterz_trace_dir, exist_ok=True)
++        default_rank = str(torch.cuda.current_device()) if torch.cuda.is_available() else "0"
++        rank = os.environ.get("RANK", default_rank)
++        path = os.path.join(self._freaksterz_trace_dir, f"dflash2-{rank}-{name}.pt")
++        torch.save(value.reshape(-1, value.shape[-1])[:8].detach().float().cpu(), path)
++        self._freaksterz_trace_written.add(name)
++
++    def native_to_freaksterz_head(self, hidden_states: torch.Tensor) -> torch.Tensor:
++        if not self._freaksterz_adapter_enabled:
++            return hidden_states
++        # Main absorbed the original zero-centered final RMSNorm gain into
++        # lm_head. Undo that gain before rotating into the shared head's basis.
++        hidden_states = hidden_states * self._freaksterz_gain_inv
++        return torch.matmul(hidden_states, self._freaksterz_rotation.T)
++
++    def freaksterz_to_native(self, hidden_states: torch.Tensor) -> torch.Tensor:
++        """Convert a rotated target residual tensor to DFlash's native basis."""
++        if not self._freaksterz_adapter_enabled:
++            return hidden_states
++        return torch.matmul(hidden_states, self._freaksterz_rotation)
+ 
+ 
+ class DFlash2Qwen3ForCausalLM(DFlashQwen3ForCausalLM):
+@@ -279,12 +354,40 @@
+             soft_cap=softcap if softcap > 0 else None,
+         )
+ 
++    def combine_hidden_states(self, hidden_states: torch.Tensor) -> torch.Tensor:
++        if not self.model._freaksterz_adapter_enabled:
++            self.model.trace_boundary("native_aux_taps", hidden_states)
++            return super().combine_hidden_states(hidden_states)
++        if not self.model.use_aux_hidden_state:
++            return hidden_states
++        hidden_size = int(self.config.hidden_size)
++        if hidden_states.shape[-1] % hidden_size:
++            raise RuntimeError(
++                "Freaksterz auxiliary hidden width is not a multiple of "
++                f"hidden_size: {hidden_states.shape[-1]}"
++            )
++        original_shape = hidden_states.shape
++        chunks = hidden_states.reshape(
++            *original_shape[:-1], original_shape[-1] // hidden_size, hidden_size
++        )
++        chunks = self.model.freaksterz_to_native(chunks)
++        native_hidden_states = chunks.reshape(original_shape)
++        self.model.trace_boundary("native_aux_taps", native_hidden_states)
++        return super().combine_hidden_states(native_hidden_states)
++
+     def compute_candidates(
+         self, hidden_states: torch.Tensor
+     ) -> tuple[torch.Tensor, torch.Tensor]:
++        self.model.trace_boundary("native_draft_hidden", hidden_states)
++        head_input = self.model.native_to_freaksterz_head(hidden_states)
++        self.model.trace_boundary("main_head_input", head_input)
+         return self.candidate_logits_processor.get_top_k_tokens(
+-            self.lm_head, hidden_states, self.model.candidate_selector.top_k
++            self.lm_head, head_input, self.model.candidate_selector.top_k
+         )
+ 
++    def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor | None:
++        head_input = self.model.native_to_freaksterz_head(hidden_states)
++        return super().compute_logits(head_input)
++
+ 
+ EntryClass = DFlash2Qwen3ForCausalLM
