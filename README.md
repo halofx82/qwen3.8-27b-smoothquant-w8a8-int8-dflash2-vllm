@@ -53,16 +53,6 @@ DRAFT_MODEL=z-lab/Qwen3.8-27B-DFlash2
 Stop the service with `docker compose down`. The repository intentionally does
 not apply a custom P2P or all-reduce patch; networking behavior is stock vLLM.
 
-## Why Lued needs one more fallback
-
-z-lab's BF16 QKV projections expose dense weights, so vLLM fuses the five
-context-KV projections into one GEMM. Lued's compressed-tensors W8A16 QKV
-projections intentionally have no dense `weight` tensor. The patch detects
-that representation and runs the five native quantized QKV projections instead,
-then uses the normal K-norm, RoPE, and KV-cache write path. This preserves the
-W8 drafter's memory saving, though its long-context draft prefill can be slower
-than z-lab's fused path.
-
 ## Verify startup
 
 For z-lab, the logs should contain:
@@ -76,6 +66,42 @@ For Lued, they should additionally contain:
 ```text
 DFlash context-KV uses quantized per-layer QKV projections
 ```
+
+## Why Lued needs one more fallback
+
+z-lab's BF16 QKV projections expose dense weights, so vLLM fuses the five
+context-KV projections into one GEMM. Lued's compressed-tensors W8A16 QKV
+projections intentionally have no dense `weight` tensor. The patch detects
+that representation and runs the five native quantized QKV projections instead,
+then uses the normal K-norm, RoPE, and KV-cache write path. This preserves the
+W8 drafter's memory saving, though its long-context draft prefill can be slower
+than z-lab's fused path.
+
+## How the bridge works
+
+Freaksterz `main` applies one global orthogonal rotation to its residual
+stream. In row-vector notation:
+
+```text
+h_rot = h_native @ R.T
+```
+
+The DFlash2 checkpoints were trained in the native basis. vLLM normally shares
+the target token embedding and LM head with DFlash2 and passes target auxiliary
+hidden-state taps to its `fc` projection. That is incompatible with a rotated
+target, so the included vLLM patch applies three exact runtime bridges:
+
+1. It maps shared target embeddings from rotated to native basis before draft
+   inference: `E_rot @ R`.
+2. It independently maps each of the five target auxiliary taps with
+   `h_rot @ R` before the trained DFlash2 `fc` projection.
+3. It maps native DFlash hidden states into Freaksterz's rotated LM-head basis
+   with the inverse final-norm gain and `R.T`; the candidate selector remains
+   native, exactly as trained.
+
+The adapter is runtime-only: neither the Freaksterz target nor either DFlash2
+checkpoint is rewritten or retrained.
+
 
 ## Recreate the adapter locally
 
@@ -115,7 +141,6 @@ and `--main /path/to/freaksterz-main` to both scripts. The expected original
 rotation SHA-256 is `8d6dd7bb2278c288f4e74583807bbc6429200839ecf8fe6e9319a23326e6a505`;
 the existing published adapter SHA-256 is
 `1c0d668abd1e1bbfe7a4d98cb6dbf40e2a34b909bffd7c849f40648f1ef64f09`.
-
 
 
 ## Fine-tune DFlash2 on Freaksterz traces
@@ -249,28 +274,3 @@ Validation loss is useful as a training signal but is not a reliable serving
 selection criterion for DFlash2. Export and measure each epoch on a fixed,
 held-out Hermes/SWE prompt suite, then keep the checkpoint with the best real
 vLLM acceptance rate.
-
-## How the bridge works
-
-Freaksterz `main` applies one global orthogonal rotation to its residual
-stream. In row-vector notation:
-
-```text
-h_rot = h_native @ R.T
-```
-
-The DFlash2 checkpoints were trained in the native basis. vLLM normally shares
-the target token embedding and LM head with DFlash2 and passes target auxiliary
-hidden-state taps to its `fc` projection. That is incompatible with a rotated
-target, so the included vLLM patch applies three exact runtime bridges:
-
-1. It maps shared target embeddings from rotated to native basis before draft
-   inference: `E_rot @ R`.
-2. It independently maps each of the five target auxiliary taps with
-   `h_rot @ R` before the trained DFlash2 `fc` projection.
-3. It maps native DFlash hidden states into Freaksterz's rotated LM-head basis
-   with the inverse final-norm gain and `R.T`; the candidate selector remains
-   native, exactly as trained.
-
-The adapter is runtime-only: neither the Freaksterz target nor either DFlash2
-checkpoint is rewritten or retrained.
