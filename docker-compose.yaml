@@ -13,7 +13,9 @@ services:
       - ${HOME}/.cache/huggingface:/root/.cache/huggingface
       - ./.cache/vllm:/root/.cache/vllm
     environment:
-      CUDA_VISIBLE_DEVICES: "0,1,2,3"
+      CUDA_VISIBLE_DEVICES: ${CUDA_VISIBLE_DEVICES:-0,1,2,3}
+      TENSOR_PARALLEL_SIZE: ${TENSOR_PARALLEL_SIZE:-4}
+      MAX_MODEL_LEN: ${MAX_MODEL_LEN:-131072}
       PYTORCH_ALLOC_CONF: expandable_segments:False
     deploy:
       resources:
@@ -32,13 +34,13 @@ services:
       - --port
       - "8000"
       - --tensor-parallel-size
-      - "4"
+      - ${TENSOR_PARALLEL_SIZE:-4}
       - --quantization
       - compressed-tensors
       - --dtype
       - bfloat16
       - --max-model-len
-      - "131072"
+      - ${MAX_MODEL_LEN:-131072}
       - --gpu-memory-utilization
       - "0.90"
       - --max-num-seqs
