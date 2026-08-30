@@ -1,0 +1,151 @@
+diff --git a/hs_connectors/src/hs_connectors/transfer.py b/hs_connectors/src/hs_connectors/transfer.py
+index cf3b69a..8359d7d 100644
+--- a/hs_connectors/src/hs_connectors/transfer.py
++++ b/hs_connectors/src/hs_connectors/transfer.py
+@@ -13,6 +13,7 @@ from pathlib import Path
+ from typing import TYPE_CHECKING, Any, ClassVar
+ 
+ import torch
++from safetensors import safe_open
+ from safetensors.torch import load_file
+ 
+ from hs_connectors.mooncake_store import MooncakeHiddenStatesStore, MooncakeStoreConfig
+@@ -50,8 +51,15 @@ class HiddenStatesTransfer(ABC):
+         """Lazy initialization (safe to call from dataloader worker)."""
+ 
+     @abstractmethod
+-    def get_cached(self, file_idx: int) -> dict[str, torch.Tensor] | None:
+-        """Return a previously cached sample, or ``None``."""
++    def get_cached(
++        self, file_idx: int, *, max_rows: int | None = None
++    ) -> dict[str, torch.Tensor] | None:
++        """Return a previously cached sample, optionally truncated by rows.
++
++        File-backed hidden-state samples can be hundreds of MiB.  Training's
++        multipack sampler truncates overlong samples to its token budget, so a
++        backend that supports it should avoid reading unused trailing rows.
++        """
+ 
+     @abstractmethod
+     def get_generated(self, handle: str) -> dict[str, torch.Tensor] | None:
+@@ -122,13 +130,32 @@ class HiddenStatesBackend(ABC):
+ # ---------------------------------------------------------------------------
+ 
+ 
+-def _load_hs_file(file_path: Path) -> dict[str, torch.Tensor] | None:
++def _load_hs_file(
++    file_path: Path, *, max_rows: int | None = None
++) -> dict[str, torch.Tensor] | None:
+     lock_path = str(file_path) + ".lock"
+     if Path(lock_path).exists():
+         wait_for_lock(lock_path)
+ 
+     if file_path.exists():
+-        return load_file(file_path)
++        if max_rows is None:
++            return load_file(file_path)
++
++        # ``safe_open.get_slice`` reads only the requested tensor region,
++        # unlike ``load_file`` which materializes the entire trace before the
++        # collator later truncates it.  All current trace tensors are indexed
++        # by token in dimension zero; preserve any scalar metadata unchanged.
++        with safe_open(str(file_path), framework="pt", device="cpu") as file:
++            tensors = {}
++            for name in file.keys():
++                tensor_slice = file.get_slice(name)
++                shape = tensor_slice.get_shape()
++                tensors[name] = (
++                    tensor_slice[:max_rows]
++                    if shape and shape[0] > max_rows
++                    else tensor_slice[:]
++                )
++            return tensors
+ 
+     return None
+ 
+@@ -139,9 +166,11 @@ class FileTransfer(HiddenStatesTransfer):
+     def __init__(self, hidden_states_path: Path):
+         self.hidden_states_path = hidden_states_path
+ 
+-    def get_cached(self, file_idx: int) -> dict[str, torch.Tensor] | None:
++    def get_cached(
++        self, file_idx: int, *, max_rows: int | None = None
++    ) -> dict[str, torch.Tensor] | None:
+         path = self.hidden_states_path / f"hs_{file_idx}.safetensors"
+-        return _load_hs_file(path)
++        return _load_hs_file(path, max_rows=max_rows)
+ 
+     def get_generated(self, handle: str) -> dict[str, torch.Tensor] | None:
+         return _load_hs_file(Path(handle))
+@@ -218,7 +247,9 @@ class MooncakeTransfer(HiddenStatesTransfer):
+         if not self.store.is_setup:
+             self.store.setup()
+ 
+-    def get_cached(self, file_idx: int) -> dict[str, torch.Tensor] | None:  # noqa: ARG002
++    def get_cached(  # noqa: ARG002
++        self, file_idx: int, *, max_rows: int | None = None
++    ) -> dict[str, torch.Tensor] | None:
+         return None
+ 
+     def get_generated(self, handle: str) -> dict[str, torch.Tensor] | None:
+diff --git a/src/speculators/models/utils.py b/src/speculators/models/utils.py
+index 8d3c4ff..a3408a2 100644
+--- a/src/speculators/models/utils.py
++++ b/src/speculators/models/utils.py
+@@ -1,4 +1,5 @@
+ import logging
++import os
+ import warnings
+ from copy import deepcopy
+ from functools import partial
+@@ -12,7 +13,10 @@ logger = logging.getLogger(__name__)
+ def conditional_torch_compile(func=None, *args, **kwargs):
+     if func is None:
+         return partial(conditional_torch_compile, *args, **kwargs)
+-    if torch.cuda.is_available() and hasattr(torch, "compile"):
++    compile_enabled = os.environ.get(
++        "SPECULATORS_TORCH_COMPILE", "1"
++    ).lower() in ("1", "true", "yes")
++    if compile_enabled and torch.cuda.is_available() and hasattr(torch, "compile"):
+         return torch.compile(func, *args, **kwargs)
+     return func
+ 
+diff --git a/src/speculators/train/data.py b/src/speculators/train/data.py
+index be84676..14409db 100644
+--- a/src/speculators/train/data.py
++++ b/src/speculators/train/data.py
+@@ -256,7 +256,10 @@ class ArrowDataset(BaseDataset):
+ 
+     def _get_raw_data(self, index):
+         file_idx = self._map_to_file_idx(index)
+-        loaded_hs = self.transfer.get_cached(file_idx)
++        # The sampler truncates overlong traces to ``max_len``.  Ask the file
++        # backend to slice at read time so a 400+ MiB trace is not materialized
++        # merely to discard almost all of it in ``CollateFn``.
++        loaded_hs = self.transfer.get_cached(file_idx, max_rows=self.max_len)
+ 
+         if loaded_hs is None:
+             match self.on_missing:
+@@ -283,7 +286,12 @@ class ArrowDataset(BaseDataset):
+         #   "token_ids": [seq_len]
+         # }
+ 
+-        if not torch.equal(loaded_hs["token_ids"], self.data[index]["input_ids"]):
++        # ``FileTransfer`` may have read only the prefix needed for this
++        # training batch.  Compare like-for-like rather than rejecting a
++        # correct prefix merely because the Arrow row retains its full trace.
++        num_loaded_tokens = loaded_hs["token_ids"].shape[0]
++        expected_token_ids = self.data[index]["input_ids"][:num_loaded_tokens]
++        if not torch.equal(loaded_hs["token_ids"], expected_token_ids):
+             warnings.warn(
+                 f"Loaded token ids {loaded_hs['token_ids']} for index {index} don't"
+                 f"match input ids {self.data[index]['input_ids']}",
+@@ -299,7 +307,7 @@ class ArrowDataset(BaseDataset):
+             "verifier_last_hidden_states": loaded_hs["hidden_states"][
+                 :, -1
+             ],  # [seq_len, hidden_size]
+-            "loss_mask": self.data[index]["loss_mask"],  # [seq_len]
++            "loss_mask": self.data[index]["loss_mask"][:num_loaded_tokens],
+         }
+ 
+ 

@@ -53,6 +53,138 @@ DRAFT_MODEL=z-lab/Qwen3.8-27B-DFlash2
 Stop the service with `docker compose down`. The repository intentionally does
 not apply a custom P2P or all-reduce patch; networking behavior is stock vLLM.
 
+## Fine-tune DFlash2 on Freaksterz traces
+
+The included training path preserves the official Z-Lab DFlash2 weights.  It
+does **not** train a new drafter from scratch:
+
+```text
+SWE-smith trajectory -> Freaksterz on-policy conversation
+  -> Freaksterz auxiliary hidden states -> native-basis bridge
+  -> lossless Z-Lab-to-Speculators conversion -> DFlash2 fine-tune
+```
+
+It requires a nearby checkout of
+[vllm-project/speculators](https://github.com/vllm-project/speculators) at
+`../speculators` (or set `SPECULATORS_DIR`), with its Python environment
+installed. Apply the included training patch to that checkout before using the
+launchers below. A minimal source installation is:
+
+```bash
+git clone https://github.com/vllm-project/speculators.git ../speculators
+cd ../speculators
+uv venv .venv
+uv pip install --python .venv/bin/python -e .
+cd -
+
+# The DFlash2 large-trace training patch is required for this workflow.
+git -C ../speculators apply --check "$PWD/patches/speculators-dflash2-training.patch"
+git -C ../speculators apply "$PWD/patches/speculators-dflash2-training.patch"
+```
+
+The patch does only two functional things: it reads only the configured token
+prefix from each hidden-state safetensors file rather than materializing an
+entire long trace, and it makes full-model `torch.compile` opt-out controllable
+through `SPECULATORS_TORCH_COMPILE`. The training launcher sets the latter to
+`0`, avoiding compilation of an FSDP-wrapped draft model. It intentionally
+does not include diagnostic logging or optional attention-kernel tuning.
+
+You also need a local copy of `freaksterz-dflash-adapter.safetensors` and must
+set `ADAPTER` to it. `FREAKSTERZ_DIR` below is the cached **`main`** snapshot of
+`Freaksterz/Qwen3.8-27B-SmoothQuant-W8A8-INT8`; do not use its unrotated
+`v1-smoothquant-rtn` revision.
+
+### 1. Generate the on-policy SWE-smith corpus
+
+Start the normal Compose server on port 8000 and generate the conversations
+first. Set `COLLECT_STATES=0`: this deliberately stops the helper after
+generation, so the 4-GPU serving instance and the 4-GPU extractor never run at
+the same time.
+
+```bash
+docker compose up -d
+
+export RUN_DIR="$PWD/runs/swe-smith-freaksterz-$(date -u +%Y%m%dT%H%M%SZ)"
+export ADAPTER="$PWD/artifacts/freaksterz-dflash-adapter.safetensors"
+
+RUN_DIR="$RUN_DIR" \
+MAX_SAMPLES=5000 \
+SEQ_LENGTH=8192 \
+CONCURRENCY=4 \
+COLLECT_STATES=0 \
+./scripts/prepare_swe_smith_freaksterz_training_data.sh
+```
+
+This creates `$RUN_DIR/freaksterz-on-policy.jsonl`. Once it completes, stop the
+normal server to release its GPUs:
+
+```bash
+docker compose down
+```
+
+### 2. Extract and bridge hidden states
+
+Start the target-only extractor using the now-free GPUs. `RUN_DIR` must be an
+absolute path because it is bind-mounted into Docker. Leave this command
+running while the collection command in the next terminal executes.
+
+```bash
+RUN_DIR="$RUN_DIR" ./scripts/run-hidden-states-extractor.sh
+```
+
+Then prepare the rendered rows, extract their target hidden states from port
+8001, and bridge them to the native DFlash2 basis:
+
+```bash
+DATASET="$RUN_DIR/freaksterz-on-policy.jsonl" \
+RUN_DIR="$RUN_DIR" \
+ADAPTER="$ADAPTER" \
+EXTRACT_ENDPOINT=http://127.0.0.1:8001/v1 \
+MAX_SAMPLES=5000 \
+SEQ_LENGTH=8192 \
+CONCURRENCY=4 \
+./scripts/collect_freaksterz_dflash2_data.sh
+```
+
+The useful products are `$RUN_DIR/data`, `$RUN_DIR/hidden-states`, and
+`$RUN_DIR/bridge-report.json`. Confirm that the bridge report completed and
+that the number of files in `data` and `hidden-states` agrees before stopping
+the extractor or removing `raw-hidden-states`. The trainer reads only the
+bridged copy. At the current 8192-token format, 479 examples used about 60 GiB
+each for raw and bridged states; 5,000 examples therefore need roughly 1.25
+TiB while both copies exist, or about 625 GiB after raw states are removed.
+
+### 3. Fine-tune without discarding Z-Lab weights
+
+The launcher creates a frozen native-basis training verifier, losslessly
+converts the Z-Lab checkpoint to the Speculators checkpoint format on first
+use, then launches FSDP over four GPUs. The converter copies the 81 trained
+DFlash2 tensors unchanged; it never reinitializes the convolution or candidate
+selector.
+
+```bash
+export RUN_DIR=/absolute/path/to/the/completed/run
+export FREAKSTERZ_DIR=/absolute/path/to/models--Freaksterz--Qwen3.8-27B-SmoothQuant-W8A8-INT8/snapshots/MAIN_REVISION
+export ADAPTER="$PWD/artifacts/freaksterz-dflash-adapter.safetensors"
+
+CUDA_VISIBLE_DEVICES=0,1,2,3 \
+GPUS=4 \
+SEQ_LENGTH=8192 \
+MAX_ANCHORS=32 \
+EPOCHS=2 \
+./scripts/train_freaksterz_dflash2.sh
+```
+
+`MAX_ANCHORS=32` is the verified safe default for four 24 GiB GPUs. DFlash2
+materializes full-vocabulary tensors, so increasing it needs measured VRAM
+headroom. The launch log is written to `$RUN_DIR/logs/train.log`, and every
+epoch checkpoint is under `$RUN_DIR/checkpoints`.
+
+Validation loss is useful as a training signal but is not a reliable serving
+selection criterion for DFlash2. Export and measure each epoch on a fixed,
+held-out Hermes/SWE prompt suite, then keep the checkpoint with the best real
+vLLM acceptance rate.
+
 ## How the bridge works
 
 Freaksterz `main` applies one global orthogonal rotation to its residual
